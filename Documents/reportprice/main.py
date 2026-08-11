@@ -3,7 +3,7 @@ import sys
 
 from db_manager import setup_db, save_price_record, get_product_analytics
 from multi_scraper import scrape_with_retry
-from notifier import send_telegram_alert
+from notifier import send_discord_alert
 
 
 def main():
@@ -38,8 +38,8 @@ def main():
                 "is_fba": data.get("is_fba", False),
             }
 
-            # d. Always send Telegram notification
-            send_telegram_alert(product, analytics, seller_info)
+            # d. Always send Discord notification
+            send_discord_alert(product, analytics, seller_info)
 
         except Exception as e:
             print(f"[Main] ERROR processing product_id={product['id']}: {e}")

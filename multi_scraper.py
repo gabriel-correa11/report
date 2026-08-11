@@ -12,7 +12,6 @@ from bs4 import BeautifulSoup
 
 _SESSION = requests.Session()
 
-# Realistic browser headers — shared baseline for all platforms
 _BASE_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -30,22 +29,24 @@ _BASE_HEADERS = {
     "DNT": "1",
 }
 
-_AMAZON_HEADERS = {
-    **_BASE_HEADERS,
-    "Referer": "https://www.amazon.com.br/",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
-}
+_AMAZON_HEADERS = {**_BASE_HEADERS, "Referer": "https://www.amazon.com.br/", "Cache-Control": "no-cache", "Pragma": "no-cache"}
+_KABUM_HEADERS  = {**_BASE_HEADERS, "Referer": "https://www.kabum.com.br/"}
+_MAGALU_HEADERS = {**_BASE_HEADERS, "Referer": "https://www.magazineluiza.com.br/"}
 
-_KABUM_HEADERS = {
-    **_BASE_HEADERS,
-    "Referer": "https://www.kabum.com.br/",
-}
+# ---------------------------------------------------------------------------
+# Price validation constants
+# ---------------------------------------------------------------------------
 
-_MAGALU_HEADERS = {
-    **_BASE_HEADERS,
-    "Referer": "https://www.magazineluiza.com.br/",
-}
+# Minimum plausible total price for a Nintendo Switch 2 console.
+# Any extracted value below this is treated as an installment fragment or accessory.
+MIN_VALID_PRICE = 1500.0
+
+# Text patterns that indicate an instalment context — any element whose
+# nearby text contains these is skipped.
+_INSTALLMENT_KEYWORDS = re.compile(
+    r"\b(em\s+até|\d+x|\bmensal\b|por\s+m[eê]s|parcela|prestação|vezes)\b",
+    re.IGNORECASE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -54,28 +55,40 @@ _MAGALU_HEADERS = {
 
 def clean_price(text):
     """
-    Sanitize a Brazilian price string to float.
-    'R$ 3.846,55' -> 3846.55   |   '3800' -> 3800.0
+    Convert Brazilian price string to float.
+    'R$ 3.846,55' -> 3846.55  |  '3800' -> 3800.0
+    Returns None if value is below MIN_VALID_PRICE or unparseable.
     """
     if not text:
         return None
-    text = text.strip()
-    # Remove everything except digits and comma
-    cleaned = re.sub(r"[^\d,]", "", text)
+    cleaned = re.sub(r"[^\d,]", "", text.strip())
     if not cleaned:
         return None
     if "," in cleaned:
-        # Brazilian decimal: last comma is decimal separator, dots are thousand sep
         parts = cleaned.rsplit(",", 1)
-        integer_part = parts[0].replace(",", "")
-        decimal_part = parts[1]
-        cleaned = f"{integer_part}.{decimal_part}"
+        cleaned = parts[0].replace(",", "") + "." + parts[1]
     try:
         val = float(cleaned)
-        # Sanity: reject suspiciously small values (e.g. fragment "3,00" matching installments)
-        return val if val >= 10.0 else None
+        return val if val >= MIN_VALID_PRICE else None
     except ValueError:
         return None
+
+
+def _is_installment_context(element):
+    """
+    Returns True if the element or its parent text contains installment keywords
+    (e.g. '12x', 'em até', 'mensal', 'por mês').
+    """
+    # Check the element itself and up to 2 ancestor levels
+    node = element
+    for _ in range(3):
+        if node is None:
+            break
+        text = node.get_text(" ", strip=True)
+        if _INSTALLMENT_KEYWORDS.search(text):
+            return True
+        node = node.parent
+    return False
 
 
 def _detect_platform(url):
@@ -90,14 +103,13 @@ def _detect_platform(url):
 
 
 def _fetch(url, headers, timeout=25):
-    """Shared HTTP fetch using the persistent session."""
     resp = _SESSION.get(url, headers=headers, timeout=timeout, allow_redirects=True)
     resp.raise_for_status()
     return resp
 
 
 def _parse_jsonld(soup):
-    """Extract lowest price from JSON-LD structured data."""
+    """Extract lowest valid price from JSON-LD structured data."""
     best = None
     for script in soup.find_all("script", type="application/ld+json"):
         try:
@@ -118,7 +130,7 @@ def _parse_jsonld(soup):
             if price is not None:
                 try:
                     val = float(str(price).replace(",", "."))
-                    if val >= 10 and (best is None or val < best):
+                    if val >= MIN_VALID_PRICE and (best is None or val < best):
                         best = val
                 except ValueError:
                     pass
@@ -131,14 +143,11 @@ def _parse_jsonld(soup):
 
 def _scrape_amazon(soup):
     """
-    Amazon parser.
-
-    Priority order:
-      1. AOD offer list (#aod-offer-list) — present when ?aod=1 is rendered
-      2. Buy-box price selectors (corePrice, priceblock, .a-price .a-offscreen)
-      3. JSON-LD (injected by caller if DOM misses)
-
-    Returns dict { cash_price, seller_name, is_fba } or all-None on miss.
+    Amazon parser — 3-layer fallback:
+      1. AOD offer list (#aod-offer-list)
+      2. Buy-box price selectors (7 candidates)
+      3. JSON-LD (injected by caller)
+    Skips any element whose context contains instalment keywords.
     """
     result = {"cash_price": None, "seller_name": "Amazon", "is_fba": False}
 
@@ -147,21 +156,20 @@ def _scrape_amazon(soup):
     if aod_list:
         best_price, best_seller, best_fba = None, "Amazon", False
         for offer in aod_list.select("#aod-offer"):
-            # .a-offscreen holds the full price text (e.g. "R$ 3.800,00")
             price_el = offer.select_one(".a-offscreen")
+            if price_el and _is_installment_context(price_el):
+                continue
             price = clean_price(price_el.get_text()) if price_el else None
             if not price:
-                # Fallback: whole + fraction
                 whole = offer.select_one(".a-price-whole")
                 frac  = offer.select_one(".a-price-fraction")
-                if whole:
+                if whole and not _is_installment_context(whole):
                     raw = whole.get_text(strip=True).rstrip(",.")
                     if frac:
                         raw += "," + frac.get_text(strip=True)
                     price = clean_price(raw)
             if not price:
                 continue
-
             seller_el = (
                 offer.select_one("#aod-offer-soldBy .a-size-small") or
                 offer.select_one("#aod-offer-soldBy a") or
@@ -180,7 +188,7 @@ def _scrape_amazon(soup):
             result.update(cash_price=best_price, seller_name=best_seller, is_fba=best_fba)
             return result
 
-    # 2. Buy-box selectors (rendered page / standard product page)
+    # 2. Buy-box selectors
     buybox_selectors = [
         "#corePrice_feature_div .a-offscreen",
         "#corePrice_feature_div .a-price .a-offscreen",
@@ -192,13 +200,12 @@ def _scrape_amazon(soup):
     ]
     for sel in buybox_selectors:
         el = soup.select_one(sel)
-        if el:
+        if el and not _is_installment_context(el):
             price = clean_price(el.get_text())
             if price:
                 result["cash_price"] = price
                 break
 
-    # Seller
     seller_el = (
         soup.select_one("#sellerProfileTriggerId") or
         soup.select_one("#merchant-info a") or
@@ -207,7 +214,6 @@ def _scrape_amazon(soup):
     if seller_el:
         result["seller_name"] = seller_el.get_text(strip=True)
 
-    # FBA flag
     page_text = soup.get_text()
     if "Enviado pela Amazon" in page_text or "Dispatched from and sold by Amazon" in page_text:
         result["is_fba"] = True
@@ -217,40 +223,42 @@ def _scrape_amazon(soup):
 
 def _scrape_kabum(soup):
     """
-    KaBuM! parser — prioritises PIX / cash price over instalment price.
-    Returns dict { cash_price, seller_name }.
+    KaBuM! parser — targets the main cash/PIX price card,
+    explicitly ignoring instalment badge elements.
     """
     result = {"cash_price": None, "seller_name": "KaBuM!"}
 
-    # Ordered CSS selectors: most-specific cash/PIX price first
+    # Ordered CSS selectors: cash/PIX price first, most specific to least
     cash_selectors = [
+        'span[class*="priceCard"]',       # main price card
         'span[class*="finalPrice"]',
-        'span[class*="priceCard"]',
         'b[class*="regularPrice"]',
-        '[class*="cash"] [class*="price"]',
-        '[data-testid*="price"]',
+        '[data-testid*="price"]:not([data-testid*="installment"])',
         'h4[class*="price"]',
-        'span[class*="Price"]',
+        'span[class*="Price"]:not([class*="installment"]):not([class*="Installment"])',
     ]
     for sel in cash_selectors:
         el = soup.select_one(sel)
-        if el:
+        if el and not _is_installment_context(el):
             price = clean_price(el.get_text())
-            if price and price > 50:
+            if price:
                 result["cash_price"] = price
                 break
 
-    # Regex fallback: scan visible text for "R$ X.XXX,XX" patterns and take the lowest
+    # Regex fallback: scan full-price patterns "R$ X.XXX,XX" from page text,
+    # split by lines to avoid mixing instalment lines, take the minimum valid value.
     if result["cash_price"] is None:
         candidates = []
-        for match in re.finditer(r"R\$\s*[\d\.]+,\d{2}", soup.get_text()):
-            price = clean_price(match.group())
-            if price and price > 50:
-                candidates.append(price)
+        for line in soup.get_text("\n").splitlines():
+            if _INSTALLMENT_KEYWORDS.search(line):
+                continue
+            for match in re.finditer(r"R\$\s*[\d\.]+,\d{2}", line):
+                price = clean_price(match.group())
+                if price:
+                    candidates.append(price)
         if candidates:
             result["cash_price"] = min(candidates)
 
-    # Seller
     seller_el = (
         soup.select_one('[class*="sellerName"]') or
         soup.select_one('[class*="seller-name"]') or
@@ -264,38 +272,38 @@ def _scrape_kabum(soup):
 
 def _scrape_magalu(soup, url):
     """
-    Magazine Luiza parser — prioritises à vista / PIX price.
-    Returns dict { cash_price, seller_name }.
+    Magazine Luiza parser — targets à vista / PIX price,
+    skips instalment context elements.
     """
     result = {"cash_price": None, "seller_name": "Magalu"}
 
-    # Ordered: PIX/cash price before instalment
     cash_selectors = [
         '[data-testid="price-value"]',
-        '[data-testid="installment-price"] ~ [data-testid="price-value"]',
         'p[data-testid="price-value"]',
         '[class*="price-value"]',
-        '[class*="sc-dkzDqf"]',   # Magalu styled-component cash price
+        '[class*="sc-dkzDqf"]',
     ]
     for sel in cash_selectors:
         el = soup.select_one(sel)
-        if el:
+        if el and not _is_installment_context(el):
             price = clean_price(el.get_text())
-            if price and price > 50:
+            if price:
                 result["cash_price"] = price
                 break
 
-    # Regex fallback over page text (same as Kabum — take lowest R$ match)
+    # Regex fallback with instalment line filtering
     if result["cash_price"] is None:
         candidates = []
-        for match in re.finditer(r"R\$\s*[\d\.]+,\d{2}", soup.get_text()):
-            price = clean_price(match.group())
-            if price and price > 50:
-                candidates.append(price)
+        for line in soup.get_text("\n").splitlines():
+            if _INSTALLMENT_KEYWORDS.search(line):
+                continue
+            for match in re.finditer(r"R\$\s*[\d\.]+,\d{2}", line):
+                price = clean_price(match.group())
+                if price:
+                    candidates.append(price)
         if candidates:
             result["cash_price"] = min(candidates)
 
-    # Seller
     seller_el = (
         soup.select_one('[data-testid="seller-info"]') or
         soup.select_one('[data-testid="seller-name"]') or
@@ -318,24 +326,18 @@ def _scrape_magalu(soup, url):
 
 def _scrape_url(url):
     """
-    Fetches one URL, dispatches to the right parser, and returns:
+    Fetches one URL, dispatches to the right parser, returns:
       { cash_price, seller_name, is_fba, url, platform }
-    or None on failure / no price found.
+    or None on failure / no valid price found.
     """
     platform = _detect_platform(url)
-
-    # Pick per-platform headers
-    headers_map = {
-        "amazon": _AMAZON_HEADERS,
-        "kabum":  _KABUM_HEADERS,
-        "magalu": _MAGALU_HEADERS,
-    }
+    headers_map = {"amazon": _AMAZON_HEADERS, "kabum": _KABUM_HEADERS, "magalu": _MAGALU_HEADERS}
     headers = headers_map.get(platform, _BASE_HEADERS)
 
     try:
         resp = _fetch(url, headers)
     except requests.RequestException as e:
-        print(f"[Scraper] ✗ HTTP error ({platform}) {url}: {e}")
+        print(f"[Scraper] ✗ HTTP error ({platform.upper()}) — {e}")
         return None
 
     soup = BeautifulSoup(resp.text, "html.parser")
@@ -346,34 +348,27 @@ def _scrape_url(url):
         if data["cash_price"] is None:
             data["cash_price"] = jsonld_price
         data.setdefault("is_fba", False)
-
     elif platform == "kabum":
         data = _scrape_kabum(soup)
         if data["cash_price"] is None:
             data["cash_price"] = jsonld_price
         data["is_fba"] = False
-
     elif platform == "magalu":
         data = _scrape_magalu(soup, url)
         if data["cash_price"] is None:
             data["cash_price"] = jsonld_price
         data["is_fba"] = False
-
     else:
-        data = {
-            "cash_price": jsonld_price,
-            "seller_name": "Unknown",
-            "is_fba": False,
-        }
+        data = {"cash_price": jsonld_price, "seller_name": "Unknown", "is_fba": False}
 
     price = data.get("cash_price")
-    if not price:
-        print(f"[Scraper] ✗ No price found — {platform.upper()}: {url}")
+
+    # Final safety gate: reject anything below the minimum valid price
+    if not price or price < MIN_VALID_PRICE:
+        print(f"[Scraper] ✗ {platform.upper()}: price R$ {price} rejected (below R$ {MIN_VALID_PRICE:.0f} floor)")
         return None
 
-    label = platform.upper().ljust(6)
-    print(f"[Scraper] ✔ {label} | {data['seller_name']} | R$ {price:.2f}")
-
+    print(f"[Scraper] ✔ {platform.upper().ljust(6)} | {data['seller_name']} | R$ {price:.2f}")
     data["url"] = url
     data["platform"] = platform
     return data

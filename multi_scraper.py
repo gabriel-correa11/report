@@ -29,9 +29,35 @@ _BASE_HEADERS = {
     "DNT": "1",
 }
 
-_AMAZON_HEADERS = {**_BASE_HEADERS, "Referer": "https://www.amazon.com.br/", "Cache-Control": "no-cache", "Pragma": "no-cache"}
-_KABUM_HEADERS  = {**_BASE_HEADERS, "Referer": "https://www.kabum.com.br/"}
-_MAGALU_HEADERS = {**_BASE_HEADERS, "Referer": "https://www.magazineluiza.com.br/"}
+_AMAZON_HEADERS = {
+    **_BASE_HEADERS,
+    "Referer": "https://www.amazon.com.br/",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+}
+
+_KABUM_HEADERS = {
+    **_BASE_HEADERS,
+    "Referer": "https://www.kabum.com.br/",
+}
+
+# Full Chrome Sec-* header set to pass Magalu's bot fingerprinting check.
+_MAGALU_HEADERS = {
+    **_BASE_HEADERS,
+    "Referer": "https://www.magazineluiza.com.br/",
+    "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-User": "?1",
+}
+
+# Magalu homepage used for cookie warm-up before product page requests.
+_MAGALU_HOME = "https://www.magazineluiza.com.br/"
+_magalu_warmed_up = False
+
 
 # ---------------------------------------------------------------------------
 # Price validation constants
@@ -44,13 +70,10 @@ _INSTALLMENT_KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 
-# Patterns that indicate a Pix / cash discount is advertised on the page.
-# Captures an optional explicit percentage (e.g. "5% de desconto no Pix").
 _PIX_DISCOUNT_RE = re.compile(
     r"(\d+(?:[.,]\d+)?)\s*%\s*(?:de\s+)?(?:desconto\s+)?(?:off\s+)?(?:à\s+vista|no\s+pix|pix|nupay|nu\s*pay)",
     re.IGNORECASE,
 )
-# Fallback: generic "X% off à vista" / "X% no Pix" without "desconto" word
 _PIX_DISCOUNT_RE2 = re.compile(
     r"(?:desconto|off|cashback)\s+(?:de\s+)?(\d+(?:[.,]\d+)?)\s*%\s*(?:à\s+vista|no\s+pix|pix|nupay)",
     re.IGNORECASE,
@@ -100,8 +123,7 @@ def _is_installment_context(element):
 def _extract_pix_discount(page_text):
     """
     Scans the full page text for an advertised Pix/cash discount percentage.
-    Returns the discount as a float fraction (e.g. 0.05 for 5%), or 0.0 if
-    no discount is found.
+    Returns the discount as a float fraction (e.g. 0.05 for 5%), or 0.0.
     """
     for pattern in (_PIX_DISCOUNT_RE, _PIX_DISCOUNT_RE2):
         match = pattern.search(page_text)
@@ -109,7 +131,7 @@ def _extract_pix_discount(page_text):
             raw = match.group(1).replace(",", ".")
             try:
                 pct = float(raw)
-                if 0 < pct <= 30:          # sanity: ignore absurd percentages
+                if 0 < pct <= 30:
                     discount = round(pct / 100, 6)
                     print(f"[Scraper]   ↳ Pix/cash discount detected: {pct:.1f}%")
                     return discount
@@ -140,6 +162,26 @@ def _fetch(url, headers, timeout=25):
     resp = _SESSION.get(url, headers=headers, timeout=timeout, allow_redirects=True)
     resp.raise_for_status()
     return resp
+
+
+def _warmup_magalu():
+    """
+    Visit Magalu's homepage once per process to establish a real session
+    (cookies, CDN fingerprint) before hitting the product page.
+    Silently ignored if the homepage itself fails.
+    """
+    global _magalu_warmed_up
+    if _magalu_warmed_up:
+        return
+    try:
+        # First request: homepage with no Referer (simulates direct navigation)
+        warmup_headers = {**_MAGALU_HEADERS, "Referer": "", "Sec-Fetch-Site": "none"}
+        _SESSION.get(_MAGALU_HOME, headers=warmup_headers, timeout=15, allow_redirects=True)
+        _magalu_warmed_up = True
+        print("[Scraper]   ↳ Magalu session warmed up")
+        time.sleep(1)   # brief pause to mimic human cadence
+    except Exception:
+        pass  # warm-up failure is non-fatal; product fetch will still try
 
 
 def _parse_jsonld(soup):
@@ -177,16 +219,8 @@ def _parse_jsonld(soup):
 
 def _scrape_amazon(soup, page_text):
     """
-    Amazon parser — 3-layer fallback:
-      1. BuyBox main offer (standard product page)
-      2. AOD offer list (#aod-offer-list) — all-offers page
-      3. JSON-LD injected by caller
-
-    After extracting the base price, detects any advertised Pix/NuPay/cash
-    discount and applies it. BuyBox price is compared against the best
-    marketplace offer; the lower of the two is returned.
-
-    Returns dict { cash_price, base_price, pix_discount, seller_name, is_fba }.
+    Amazon parser — BuyBox first, then AOD offer list, JSON-LD as last resort.
+    Applies Pix discount to every extracted price and keeps the lowest overall.
     """
     result = {
         "cash_price": None,
@@ -199,9 +233,7 @@ def _scrape_amazon(soup, page_text):
     pix_discount = _extract_pix_discount(page_text)
     result["pix_discount"] = pix_discount
 
-    # ------------------------------------------------------------------
-    # 1. BuyBox — main offer (most reliable for the featured seller)
-    # ------------------------------------------------------------------
+    # 1. BuyBox
     buybox_selectors = [
         "#corePrice_feature_div .a-offscreen",
         "#corePrice_feature_div .a-price .a-offscreen",
@@ -223,7 +255,6 @@ def _scrape_amazon(soup, page_text):
     if buybox_price:
         result["base_price"] = buybox_price
         result["cash_price"] = _apply_pix_discount(buybox_price, pix_discount)
-
         seller_el = (
             soup.select_one("#sellerProfileTriggerId") or
             soup.select_one("#merchant-info a") or
@@ -234,19 +265,15 @@ def _scrape_amazon(soup, page_text):
         if "Enviado pela Amazon" in page_text or "Dispatched from and sold by Amazon" in page_text:
             result["is_fba"] = True
 
-    # ------------------------------------------------------------------
-    # 2. AOD offer list — compare against buybox and take the lower
-    # ------------------------------------------------------------------
+    # 2. AOD offer list — compare against buybox and keep the lower
     aod_list = soup.select_one("#aod-offer-list")
     if aod_list:
         best_aod_price, best_aod_seller, best_aod_fba = None, "Amazon", False
-
         for offer in aod_list.select("#aod-offer"):
             price_el = offer.select_one(".a-offscreen")
             if price_el and _is_installment_context(price_el):
                 continue
             price = clean_price(price_el.get_text()) if price_el else None
-
             if not price:
                 whole = offer.select_one(".a-price-whole")
                 frac  = offer.select_one(".a-price-fraction")
@@ -255,12 +282,9 @@ def _scrape_amazon(soup, page_text):
                     if frac:
                         raw += "," + frac.get_text(strip=True)
                     price = clean_price(raw)
-
             if not price:
                 continue
-
             price = _apply_pix_discount(price, pix_discount)
-
             seller_el = (
                 offer.select_one("#aod-offer-soldBy .a-size-small") or
                 offer.select_one("#aod-offer-soldBy a") or
@@ -275,7 +299,6 @@ def _scrape_amazon(soup, page_text):
             if best_aod_price is None or price < best_aod_price:
                 best_aod_price, best_aod_seller, best_aod_fba = price, seller, fba
 
-        # Keep whichever is cheaper: buybox or best marketplace offer
         if best_aod_price and (result["cash_price"] is None or best_aod_price < result["cash_price"]):
             result["cash_price"] = best_aod_price
             result["seller_name"] = best_aod_seller
@@ -385,8 +408,17 @@ def _scrape_url(url):
     or None on failure / no valid price.
     """
     platform = _detect_platform(url)
-    headers_map = {"amazon": _AMAZON_HEADERS, "kabum": _KABUM_HEADERS, "magalu": _MAGALU_HEADERS}
+    headers_map = {
+        "amazon": _AMAZON_HEADERS,
+        "kabum":  _KABUM_HEADERS,
+        "magalu": _MAGALU_HEADERS,
+    }
     headers = headers_map.get(platform, _BASE_HEADERS)
+
+    # Magalu requires a warm-up request to the homepage to establish
+    # session cookies and pass CDN bot-detection before the product page.
+    if platform == "magalu":
+        _warmup_magalu()
 
     try:
         resp = _fetch(url, headers)
@@ -400,10 +432,8 @@ def _scrape_url(url):
 
     if platform == "amazon":
         data = _scrape_amazon(soup, page_text)
-        if data["cash_price"] is None:
-            # JSON-LD base price — still apply any detected Pix discount
-            if jsonld_price:
-                data["cash_price"] = _apply_pix_discount(jsonld_price, data.get("pix_discount", 0.0))
+        if data["cash_price"] is None and jsonld_price:
+            data["cash_price"] = _apply_pix_discount(jsonld_price, data.get("pix_discount", 0.0))
         data.setdefault("is_fba", False)
 
     elif platform == "kabum":
@@ -426,7 +456,6 @@ def _scrape_url(url):
         print(f"[Scraper] ✗ {platform.upper()}: R$ {price} rejected (below R$ {MIN_VALID_PRICE:.0f} floor)")
         return None
 
-    # Log base vs cash price when a Pix discount was applied
     base = data.get("base_price")
     if base and base != price:
         print(f"[Scraper] ✔ {platform.upper().ljust(6)} | {data['seller_name']} | R$ {price:.2f}  (base R$ {base:.2f} - Pix discount)")

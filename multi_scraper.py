@@ -37,14 +37,22 @@ _MAGALU_HEADERS = {**_BASE_HEADERS, "Referer": "https://www.magazineluiza.com.br
 # Price validation constants
 # ---------------------------------------------------------------------------
 
-# Minimum plausible total price for a Nintendo Switch 2 console.
-# Any extracted value below this is treated as an installment fragment or accessory.
 MIN_VALID_PRICE = 1500.0
 
-# Text patterns that indicate an instalment context — any element whose
-# nearby text contains these is skipped.
 _INSTALLMENT_KEYWORDS = re.compile(
     r"\b(em\s+até|\d+x|\bmensal\b|por\s+m[eê]s|parcela|prestação|vezes)\b",
+    re.IGNORECASE,
+)
+
+# Patterns that indicate a Pix / cash discount is advertised on the page.
+# Captures an optional explicit percentage (e.g. "5% de desconto no Pix").
+_PIX_DISCOUNT_RE = re.compile(
+    r"(\d+(?:[.,]\d+)?)\s*%\s*(?:de\s+)?(?:desconto\s+)?(?:off\s+)?(?:à\s+vista|no\s+pix|pix|nupay|nu\s*pay)",
+    re.IGNORECASE,
+)
+# Fallback: generic "X% off à vista" / "X% no Pix" without "desconto" word
+_PIX_DISCOUNT_RE2 = re.compile(
+    r"(?:desconto|off|cashback)\s+(?:de\s+)?(\d+(?:[.,]\d+)?)\s*%\s*(?:à\s+vista|no\s+pix|pix|nupay)",
     re.IGNORECASE,
 )
 
@@ -55,9 +63,9 @@ _INSTALLMENT_KEYWORDS = re.compile(
 
 def clean_price(text):
     """
-    Convert Brazilian price string to float.
-    'R$ 3.846,55' -> 3846.55  |  '3800' -> 3800.0
-    Returns None if value is below MIN_VALID_PRICE or unparseable.
+    Convert a Brazilian price string to float.
+    'R$ 3.846,55' -> 3846.55
+    Returns None if below MIN_VALID_PRICE or unparseable.
     """
     if not text:
         return None
@@ -76,19 +84,45 @@ def clean_price(text):
 
 def _is_installment_context(element):
     """
-    Returns True if the element or its parent text contains installment keywords
-    (e.g. '12x', 'em até', 'mensal', 'por mês').
+    Returns True if the element or up to 2 ancestor nodes contain
+    instalment keywords (12x, em até, mensal, por mês …).
     """
-    # Check the element itself and up to 2 ancestor levels
     node = element
     for _ in range(3):
         if node is None:
             break
-        text = node.get_text(" ", strip=True)
-        if _INSTALLMENT_KEYWORDS.search(text):
+        if _INSTALLMENT_KEYWORDS.search(node.get_text(" ", strip=True)):
             return True
         node = node.parent
     return False
+
+
+def _extract_pix_discount(page_text):
+    """
+    Scans the full page text for an advertised Pix/cash discount percentage.
+    Returns the discount as a float fraction (e.g. 0.05 for 5%), or 0.0 if
+    no discount is found.
+    """
+    for pattern in (_PIX_DISCOUNT_RE, _PIX_DISCOUNT_RE2):
+        match = pattern.search(page_text)
+        if match:
+            raw = match.group(1).replace(",", ".")
+            try:
+                pct = float(raw)
+                if 0 < pct <= 30:          # sanity: ignore absurd percentages
+                    discount = round(pct / 100, 6)
+                    print(f"[Scraper]   ↳ Pix/cash discount detected: {pct:.1f}%")
+                    return discount
+            except ValueError:
+                pass
+    return 0.0
+
+
+def _apply_pix_discount(price, discount):
+    """Apply a fractional discount and round to 2 decimal places."""
+    if discount > 0:
+        return round(price * (1 - discount), 2)
+    return price
 
 
 def _detect_platform(url):
@@ -141,25 +175,78 @@ def _parse_jsonld(soup):
 # Platform-specific parsers
 # ---------------------------------------------------------------------------
 
-def _scrape_amazon(soup):
+def _scrape_amazon(soup, page_text):
     """
     Amazon parser — 3-layer fallback:
-      1. AOD offer list (#aod-offer-list)
-      2. Buy-box price selectors (7 candidates)
-      3. JSON-LD (injected by caller)
-    Skips any element whose context contains instalment keywords.
-    """
-    result = {"cash_price": None, "seller_name": "Amazon", "is_fba": False}
+      1. BuyBox main offer (standard product page)
+      2. AOD offer list (#aod-offer-list) — all-offers page
+      3. JSON-LD injected by caller
 
-    # 1. AOD offer list
+    After extracting the base price, detects any advertised Pix/NuPay/cash
+    discount and applies it. BuyBox price is compared against the best
+    marketplace offer; the lower of the two is returned.
+
+    Returns dict { cash_price, base_price, pix_discount, seller_name, is_fba }.
+    """
+    result = {
+        "cash_price": None,
+        "base_price": None,
+        "pix_discount": 0.0,
+        "seller_name": "Amazon",
+        "is_fba": False,
+    }
+
+    pix_discount = _extract_pix_discount(page_text)
+    result["pix_discount"] = pix_discount
+
+    # ------------------------------------------------------------------
+    # 1. BuyBox — main offer (most reliable for the featured seller)
+    # ------------------------------------------------------------------
+    buybox_selectors = [
+        "#corePrice_feature_div .a-offscreen",
+        "#corePrice_feature_div .a-price .a-offscreen",
+        "#apex_offerDisplay_desktop .a-price .a-offscreen",
+        "#priceblock_ourprice",
+        "#priceblock_dealprice",
+        "#price_inside_buybox",
+        ".a-price .a-offscreen",
+    ]
+    buybox_price = None
+    for sel in buybox_selectors:
+        el = soup.select_one(sel)
+        if el and not _is_installment_context(el):
+            p = clean_price(el.get_text())
+            if p:
+                buybox_price = p
+                break
+
+    if buybox_price:
+        result["base_price"] = buybox_price
+        result["cash_price"] = _apply_pix_discount(buybox_price, pix_discount)
+
+        seller_el = (
+            soup.select_one("#sellerProfileTriggerId") or
+            soup.select_one("#merchant-info a") or
+            soup.select_one("#merchant-info")
+        )
+        if seller_el:
+            result["seller_name"] = seller_el.get_text(strip=True)
+        if "Enviado pela Amazon" in page_text or "Dispatched from and sold by Amazon" in page_text:
+            result["is_fba"] = True
+
+    # ------------------------------------------------------------------
+    # 2. AOD offer list — compare against buybox and take the lower
+    # ------------------------------------------------------------------
     aod_list = soup.select_one("#aod-offer-list")
     if aod_list:
-        best_price, best_seller, best_fba = None, "Amazon", False
+        best_aod_price, best_aod_seller, best_aod_fba = None, "Amazon", False
+
         for offer in aod_list.select("#aod-offer"):
             price_el = offer.select_one(".a-offscreen")
             if price_el and _is_installment_context(price_el):
                 continue
             price = clean_price(price_el.get_text()) if price_el else None
+
             if not price:
                 whole = offer.select_one(".a-price-whole")
                 frac  = offer.select_one(".a-price-fraction")
@@ -168,8 +255,12 @@ def _scrape_amazon(soup):
                     if frac:
                         raw += "," + frac.get_text(strip=True)
                     price = clean_price(raw)
+
             if not price:
                 continue
+
+            price = _apply_pix_discount(price, pix_discount)
+
             seller_el = (
                 offer.select_one("#aod-offer-soldBy .a-size-small") or
                 offer.select_one("#aod-offer-soldBy a") or
@@ -181,56 +272,25 @@ def _scrape_amazon(soup):
                 "Fulfilled by Amazon" in offer.get_text() or
                 seller.lower() == "amazon"
             )
-            if best_price is None or price < best_price:
-                best_price, best_seller, best_fba = price, seller, fba
+            if best_aod_price is None or price < best_aod_price:
+                best_aod_price, best_aod_seller, best_aod_fba = price, seller, fba
 
-        if best_price:
-            result.update(cash_price=best_price, seller_name=best_seller, is_fba=best_fba)
-            return result
-
-    # 2. Buy-box selectors
-    buybox_selectors = [
-        "#corePrice_feature_div .a-offscreen",
-        "#corePrice_feature_div .a-price .a-offscreen",
-        ".a-price .a-offscreen",
-        "#priceblock_ourprice",
-        "#priceblock_dealprice",
-        "#price_inside_buybox",
-        "#apex_offerDisplay_desktop .a-price .a-offscreen",
-    ]
-    for sel in buybox_selectors:
-        el = soup.select_one(sel)
-        if el and not _is_installment_context(el):
-            price = clean_price(el.get_text())
-            if price:
-                result["cash_price"] = price
-                break
-
-    seller_el = (
-        soup.select_one("#sellerProfileTriggerId") or
-        soup.select_one("#merchant-info a") or
-        soup.select_one("#merchant-info")
-    )
-    if seller_el:
-        result["seller_name"] = seller_el.get_text(strip=True)
-
-    page_text = soup.get_text()
-    if "Enviado pela Amazon" in page_text or "Dispatched from and sold by Amazon" in page_text:
-        result["is_fba"] = True
+        # Keep whichever is cheaper: buybox or best marketplace offer
+        if best_aod_price and (result["cash_price"] is None or best_aod_price < result["cash_price"]):
+            result["cash_price"] = best_aod_price
+            result["seller_name"] = best_aod_seller
+            result["is_fba"] = best_aod_fba
+            print(f"[Scraper]   ↳ AOD offer cheaper than BuyBox — using AOD price")
 
     return result
 
 
 def _scrape_kabum(soup):
-    """
-    KaBuM! parser — targets the main cash/PIX price card,
-    explicitly ignoring instalment badge elements.
-    """
+    """KaBuM! parser — targets PIX/cash price, ignores instalment badges."""
     result = {"cash_price": None, "seller_name": "KaBuM!"}
 
-    # Ordered CSS selectors: cash/PIX price first, most specific to least
     cash_selectors = [
-        'span[class*="priceCard"]',       # main price card
+        'span[class*="priceCard"]',
         'span[class*="finalPrice"]',
         'b[class*="regularPrice"]',
         '[data-testid*="price"]:not([data-testid*="installment"])',
@@ -245,8 +305,6 @@ def _scrape_kabum(soup):
                 result["cash_price"] = price
                 break
 
-    # Regex fallback: scan full-price patterns "R$ X.XXX,XX" from page text,
-    # split by lines to avoid mixing instalment lines, take the minimum valid value.
     if result["cash_price"] is None:
         candidates = []
         for line in soup.get_text("\n").splitlines():
@@ -271,10 +329,7 @@ def _scrape_kabum(soup):
 
 
 def _scrape_magalu(soup, url):
-    """
-    Magazine Luiza parser — targets à vista / PIX price,
-    skips instalment context elements.
-    """
+    """Magalu parser — targets à vista / PIX price, skips instalment elements."""
     result = {"cash_price": None, "seller_name": "Magalu"}
 
     cash_selectors = [
@@ -291,7 +346,6 @@ def _scrape_magalu(soup, url):
                 result["cash_price"] = price
                 break
 
-    # Regex fallback with instalment line filtering
     if result["cash_price"] is None:
         candidates = []
         for line in soup.get_text("\n").splitlines():
@@ -328,7 +382,7 @@ def _scrape_url(url):
     """
     Fetches one URL, dispatches to the right parser, returns:
       { cash_price, seller_name, is_fba, url, platform }
-    or None on failure / no valid price found.
+    or None on failure / no valid price.
     """
     platform = _detect_platform(url)
     headers_map = {"amazon": _AMAZON_HEADERS, "kabum": _KABUM_HEADERS, "magalu": _MAGALU_HEADERS}
@@ -341,34 +395,44 @@ def _scrape_url(url):
         return None
 
     soup = BeautifulSoup(resp.text, "html.parser")
+    page_text = soup.get_text(" ", strip=True)
     jsonld_price = _parse_jsonld(soup)
 
     if platform == "amazon":
-        data = _scrape_amazon(soup)
+        data = _scrape_amazon(soup, page_text)
         if data["cash_price"] is None:
-            data["cash_price"] = jsonld_price
+            # JSON-LD base price — still apply any detected Pix discount
+            if jsonld_price:
+                data["cash_price"] = _apply_pix_discount(jsonld_price, data.get("pix_discount", 0.0))
         data.setdefault("is_fba", False)
+
     elif platform == "kabum":
         data = _scrape_kabum(soup)
         if data["cash_price"] is None:
             data["cash_price"] = jsonld_price
         data["is_fba"] = False
+
     elif platform == "magalu":
         data = _scrape_magalu(soup, url)
         if data["cash_price"] is None:
             data["cash_price"] = jsonld_price
         data["is_fba"] = False
+
     else:
         data = {"cash_price": jsonld_price, "seller_name": "Unknown", "is_fba": False}
 
     price = data.get("cash_price")
-
-    # Final safety gate: reject anything below the minimum valid price
     if not price or price < MIN_VALID_PRICE:
-        print(f"[Scraper] ✗ {platform.upper()}: price R$ {price} rejected (below R$ {MIN_VALID_PRICE:.0f} floor)")
+        print(f"[Scraper] ✗ {platform.upper()}: R$ {price} rejected (below R$ {MIN_VALID_PRICE:.0f} floor)")
         return None
 
-    print(f"[Scraper] ✔ {platform.upper().ljust(6)} | {data['seller_name']} | R$ {price:.2f}")
+    # Log base vs cash price when a Pix discount was applied
+    base = data.get("base_price")
+    if base and base != price:
+        print(f"[Scraper] ✔ {platform.upper().ljust(6)} | {data['seller_name']} | R$ {price:.2f}  (base R$ {base:.2f} - Pix discount)")
+    else:
+        print(f"[Scraper] ✔ {platform.upper().ljust(6)} | {data['seller_name']} | R$ {price:.2f}")
+
     data["url"] = url
     data["platform"] = platform
     return data
@@ -410,7 +474,7 @@ def scrape_product(product):
         "product_name": product["name"],
         "seller_name": best["seller_name"],
         "is_fba": best.get("is_fba", False),
-        "standard_price": best["cash_price"],
+        "standard_price": best.get("base_price") or best["cash_price"],
         "cash_price": best["cash_price"],
         "shipping_cost": 0.0,
         "total_effective_cost": best["cash_price"],

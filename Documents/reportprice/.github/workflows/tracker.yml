@@ -27,3 +27,18 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: python main.py
+
+      - name: Configure git user
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Commit and push prices.db if updated
+        run: |
+          if [ -f prices.db ]; then
+            git add prices.db
+            git diff --cached --quiet || git commit -m "auto: update price_history database"
+            git push origin main
+          else
+            echo "prices.db not found, skipping commit."
+          fi

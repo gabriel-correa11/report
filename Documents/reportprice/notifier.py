@@ -25,7 +25,7 @@ _THRESHOLD_COLOR = "#ED4245"
 def _fetch_7d_history(product_id):
     """Returns list of (created_at, total_effective_cost) for the last 7 days."""
     if _USE_SQLITE:
-        db_path = DATABASE_URL.replace("sqlite:///", "") if DATABASE_URL else "price_tracker.db"
+        db_path = DATABASE_URL.replace("sqlite:///", "") if DATABASE_URL else "prices.db"
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
         cursor.execute(

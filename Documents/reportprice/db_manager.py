@@ -6,7 +6,7 @@ _USE_SQLITE = DATABASE_URL is None or DATABASE_URL.startswith("sqlite")
 
 def _get_connection():
     if _USE_SQLITE:
-        db_path = DATABASE_URL.replace("sqlite:///", "") if DATABASE_URL else "price_tracker.db"
+        db_path = DATABASE_URL.replace("sqlite:///", "") if DATABASE_URL else "prices.db"
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
         return conn

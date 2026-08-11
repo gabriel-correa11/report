@@ -13,12 +13,21 @@ from config import DATABASE_URL, DISCORD_WEBHOOK_URL
 
 _USE_SQLITE = DATABASE_URL is None or DATABASE_URL.startswith("sqlite")
 
-_BG_COLOR = "#2F3136"
+_BG_COLOR      = "#2F3136"
 _SURFACE_COLOR = "#36393F"
-_TEXT_COLOR = "#DCDDDE"
-_GRID_COLOR = "#40444B"
-_LINE_COLOR = "#5865F2"
-_THRESHOLD_COLOR = "#ED4245"
+_TEXT_COLOR    = "#DCDDDE"
+_GRID_COLOR    = "#40444B"
+_LINE_COLOR    = "#5865F2"
+
+# Badge assigned to each platform rank in the price list
+_RANK_BADGES = ["🟢", "🔵", "🟡", "🟠", "🔴"]
+
+# Human-readable platform display names
+_PLATFORM_LABELS = {
+    "amazon": "Amazon",
+    "kabum":  "KaBuM!",
+    "magalu": "Magazine Luiza",
+}
 
 
 def _fetch_7d_history(product_id):
@@ -67,7 +76,7 @@ def _fetch_7d_history(product_id):
         return [(dt, float(price)) for dt, price in rows]
 
 
-def generate_price_chart(product_id, product_name, max_alert_threshold):
+def generate_price_chart(product_id, product_name):
     """
     Queries 7-day price history and produces a dark-themed line chart.
     Returns PNG bytes (io.BytesIO) or None if there is insufficient data.
@@ -76,7 +85,7 @@ def generate_price_chart(product_id, product_name, max_alert_threshold):
     if not history:
         return None
 
-    dates = [row[0] for row in history]
+    dates  = [row[0] for row in history]
     prices = [row[1] for row in history]
 
     fig, ax = plt.subplots(figsize=(10, 4.5), facecolor=_BG_COLOR)
@@ -85,15 +94,6 @@ def generate_price_chart(product_id, product_name, max_alert_threshold):
     ax.plot(dates, prices, color=_LINE_COLOR, linewidth=2.5, marker="o",
             markersize=4, markerfacecolor=_LINE_COLOR, zorder=3)
     ax.fill_between(dates, prices, alpha=0.12, color=_LINE_COLOR)
-
-    ax.axhline(
-        y=max_alert_threshold,
-        color=_THRESHOLD_COLOR,
-        linewidth=1.5,
-        linestyle="--",
-        label=f"Teto R$ {max_alert_threshold:,.0f}".replace(",", "."),
-        zorder=2,
-    )
 
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%d/%m %Hh"))
     ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=4, maxticks=8))
@@ -119,13 +119,6 @@ def generate_price_chart(product_id, product_name, max_alert_threshold):
         pad=12,
     )
 
-    ax.legend(
-        facecolor=_BG_COLOR,
-        edgecolor=_GRID_COLOR,
-        labelcolor=_TEXT_COLOR,
-        fontsize=9,
-    )
-
     plt.tight_layout(pad=1.5)
 
     buf = io.BytesIO()
@@ -136,87 +129,73 @@ def generate_price_chart(product_id, product_name, max_alert_threshold):
 
 
 def _fmt_brl(value):
-    """Format a float as Brazilian currency string: 3846.55 -> 'R$ 3.846,55'"""
+    """3846.55 -> 'R$ 3.846,55'"""
     return f"R$ {value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def _build_price_list(candidates):
+    """
+    Given a list of candidate dicts (sorted cheapest first), build a
+    Discord markdown string listing every store with badge, seller, price,
+    and a clickable link.
+
+    Example output line:
+      🟢 **Amazon** (Over Power / FBA): R$ 3.846,55 — [Ir para a oferta](url)
+    """
+    lines = []
+    for i, c in enumerate(candidates):
+        badge        = _RANK_BADGES[i] if i < len(_RANK_BADGES) else "⚪"
+        platform_lbl = _PLATFORM_LABELS.get(c["platform"], c["platform"].capitalize())
+        seller       = c.get("seller_name") or platform_lbl
+        price_str    = _fmt_brl(c["cash_price"])
+        url          = c.get("url", "")
+        fba_tag      = " / FBA" if c.get("is_fba") else ""
+
+        # Avoid duplicating the platform name when the seller IS the platform
+        if seller.lower().replace("!", "") == platform_lbl.lower().replace("!", ""):
+            label = f"**{platform_lbl}**{fba_tag}"
+        else:
+            label = f"**{platform_lbl}** ({seller}{fba_tag})"
+
+        link = f"[Ir para a oferta]({url})" if url else ""
+        line = f"{badge} {label}: {price_str}"
+        if link:
+            line += f" — {link}"
+        lines.append(line)
+
+    return "\n".join(lines) if lines else "Nenhuma oferta encontrada."
 
 
 def send_discord_alert(product, analytics, seller_info):
     """
-    Sends a Discord embed with an attached price history chart on every run.
-    seller_info must include 'source_url' (the winning platform URL).
+    Sends a Discord embed listing all scanned prices with the historical
+    chart attached at the bottom. Called on every hourly run.
     """
     if not DISCORD_WEBHOOK_URL:
         print("[Notifier] DISCORD_WEBHOOK_URL not set. Skipping notification.")
         return
 
-    current_price = analytics.get("current_cash_price") or 0.0
-    low_7d = analytics.get("low_7d") or 0.0
-    avg_7d = analytics.get("avg_7d") or 0.0
+    candidates    = seller_info.get("all_candidates", [])
+    best_price    = candidates[0]["cash_price"] if candidates else (analytics.get("current_cash_price") or 0.0)
     max_threshold = product.get("max_alert_threshold", 3800.00)
-    target_price = product.get("target_price", 0.0)
 
-    seller_name = seller_info.get("seller_name") or "Desconhecido"
-    is_fba = seller_info.get("is_fba", False)
-    source_url = seller_info.get("source_url") or product.get("urls", [""])[0]
-    source_platform = seller_info.get("source_platform", "").capitalize()
-    delivery_label = "FBA ✅ (Enviado pela Amazon)" if is_fba else f"Direto — {source_platform}"
-
-    if current_price <= max_threshold:
-        embed_title = "🚨 ALERTA DE PREÇO - OPORTUNIDADE!"
-        embed_color = 5763719  # Green
+    if best_price <= max_threshold:
+        embed_color = 5763719   # Green — price within opportunity range
     else:
-        embed_title = "📊 RELATÓRIO DE VARREDURA HOURLY"
-        embed_color = 3447003  # Blue
+        embed_color = 3447003   # Blue  — regular hourly report
+
+    embed_title = f"📊 RELATÓRIO DE VARREDURA HOURLY - {product['name']}"
+
+    price_list_text = _build_price_list(candidates)
 
     embed = {
         "title": embed_title,
         "color": embed_color,
-        "url": source_url,
         "fields": [
             {
-                "name": "📦 Produto",
-                "value": product["name"],
+                "name": "🛒 Preços Encontrados no Momento:",
+                "value": price_list_text,
                 "inline": False,
-            },
-            {
-                "name": "💰 Menor Preço Encontrado",
-                "value": _fmt_brl(current_price),
-                "inline": True,
-            },
-            {
-                "name": "🚚 Vendedor & Plataforma",
-                "value": f"{seller_name}\n{delivery_label}",
-                "inline": True,
-            },
-            {
-                "name": "\u200b",
-                "value": "\u200b",
-                "inline": False,
-            },
-            {
-                "name": "📉 Menor Preço (7 Dias)",
-                "value": _fmt_brl(low_7d),
-                "inline": True,
-            },
-            {
-                "name": "📊 Média de Preço (7 Dias)",
-                "value": _fmt_brl(avg_7d),
-                "inline": True,
-            },
-            {
-                "name": "\u200b",
-                "value": "\u200b",
-                "inline": False,
-            },
-            {
-                "name": "🎯 Preço Alvo",
-                "value": _fmt_brl(target_price),
-                "inline": True,
-            },
-            {
-                "name": "🔴 Teto de Oportunidade",
-                "value": _fmt_brl(max_threshold),
-                "inline": True,
             },
         ],
         "image": {"url": "attachment://chart.png"},
@@ -225,12 +204,12 @@ def send_discord_alert(product, analytics, seller_info):
         },
     }
 
-    payload = {"embeds": [embed]}
-    chart_buf = generate_price_chart(product["id"], product["name"], max_threshold)
+    payload   = {"embeds": [embed]}
+    chart_buf = generate_price_chart(product["id"], product["name"])
 
     try:
         if chart_buf:
-            files = {"file": ("chart.png", chart_buf, "image/png")}
+            files    = {"file": ("chart.png", chart_buf, "image/png")}
             response = requests.post(
                 DISCORD_WEBHOOK_URL,
                 data={"payload_json": json.dumps(payload)},

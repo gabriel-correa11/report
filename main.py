@@ -20,14 +20,14 @@ def main():
     for product in products:
         print(f"\n[Main] Processing product_id={product['id']} ({product['name']})")
         try:
-            # a. Scrape all URLs, return lowest price across platforms
+            # a. Scrape all URLs, return lowest price + full candidates list
             data = scrape_with_retry(product, max_attempts=3)
 
             if data is None:
                 print(f"[Main] Skipping product_id={product['id']} — no price data found.")
                 continue
 
-            # b. Persist price record
+            # b. Persist best price record
             save_price_record(data)
 
             # c. Fetch analytics
@@ -38,6 +38,7 @@ def main():
                 "is_fba": data.get("is_fba", False),
                 "source_url": data.get("source_url"),
                 "source_platform": data.get("source_platform"),
+                "all_candidates": data.get("all_candidates", []),
             }
 
             # d. Always send Discord notification

@@ -41,7 +41,6 @@ _KABUM_HEADERS = {
     "Referer": "https://www.kabum.com.br/",
 }
 
-# Full Chrome Sec-* header set to pass Magalu's bot fingerprinting check.
 _MAGALU_HEADERS = {
     **_BASE_HEADERS,
     "Referer": "https://www.magazineluiza.com.br/",
@@ -54,10 +53,8 @@ _MAGALU_HEADERS = {
     "Sec-Fetch-User": "?1",
 }
 
-# Magalu homepage used for cookie warm-up before product page requests.
 _MAGALU_HOME = "https://www.magazineluiza.com.br/"
 _magalu_warmed_up = False
-
 
 # ---------------------------------------------------------------------------
 # Price validation constants
@@ -78,7 +75,6 @@ _PIX_DISCOUNT_RE2 = re.compile(
     r"(?:desconto|off|cashback)\s+(?:de\s+)?(\d+(?:[.,]\d+)?)\s*%\s*(?:à\s+vista|no\s+pix|pix|nupay)",
     re.IGNORECASE,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -106,10 +102,6 @@ def clean_price(text):
 
 
 def _is_installment_context(element):
-    """
-    Returns True if the element or up to 2 ancestor nodes contain
-    instalment keywords (12x, em até, mensal, por mês …).
-    """
     node = element
     for _ in range(3):
         if node is None:
@@ -121,10 +113,6 @@ def _is_installment_context(element):
 
 
 def _extract_pix_discount(page_text):
-    """
-    Scans the full page text for an advertised Pix/cash discount percentage.
-    Returns the discount as a float fraction (e.g. 0.05 for 5%), or 0.0.
-    """
     for pattern in (_PIX_DISCOUNT_RE, _PIX_DISCOUNT_RE2):
         match = pattern.search(page_text)
         if match:
@@ -141,7 +129,6 @@ def _extract_pix_discount(page_text):
 
 
 def _apply_pix_discount(price, discount):
-    """Apply a fractional discount and round to 2 decimal places."""
     if discount > 0:
         return round(price * (1 - discount), 2)
     return price
@@ -165,27 +152,20 @@ def _fetch(url, headers, timeout=25):
 
 
 def _warmup_magalu():
-    """
-    Visit Magalu's homepage once per process to establish a real session
-    (cookies, CDN fingerprint) before hitting the product page.
-    Silently ignored if the homepage itself fails.
-    """
     global _magalu_warmed_up
     if _magalu_warmed_up:
         return
     try:
-        # First request: homepage with no Referer (simulates direct navigation)
         warmup_headers = {**_MAGALU_HEADERS, "Referer": "", "Sec-Fetch-Site": "none"}
         _SESSION.get(_MAGALU_HOME, headers=warmup_headers, timeout=15, allow_redirects=True)
         _magalu_warmed_up = True
         print("[Scraper]   ↳ Magalu session warmed up")
-        time.sleep(1)   # brief pause to mimic human cadence
+        time.sleep(1)
     except Exception:
-        pass  # warm-up failure is non-fatal; product fetch will still try
+        pass
 
 
 def _parse_jsonld(soup):
-    """Extract lowest valid price from JSON-LD structured data."""
     best = None
     for script in soup.find_all("script", type="application/ld+json"):
         try:
@@ -212,16 +192,11 @@ def _parse_jsonld(soup):
                     pass
     return best
 
-
 # ---------------------------------------------------------------------------
 # Platform-specific parsers
 # ---------------------------------------------------------------------------
 
 def _scrape_amazon(soup, page_text):
-    """
-    Amazon parser — BuyBox first, then AOD offer list, JSON-LD as last resort.
-    Applies Pix discount to every extracted price and keeps the lowest overall.
-    """
     result = {
         "cash_price": None,
         "base_price": None,
@@ -309,7 +284,6 @@ def _scrape_amazon(soup, page_text):
 
 
 def _scrape_kabum(soup):
-    """KaBuM! parser — targets PIX/cash price, ignores instalment badges."""
     result = {"cash_price": None, "seller_name": "KaBuM!"}
 
     cash_selectors = [
@@ -352,7 +326,6 @@ def _scrape_kabum(soup):
 
 
 def _scrape_magalu(soup, url):
-    """Magalu parser — targets à vista / PIX price, skips instalment elements."""
     result = {"cash_price": None, "seller_name": "Magalu"}
 
     cash_selectors = [
@@ -396,15 +369,14 @@ def _scrape_magalu(soup, url):
 
     return result
 
-
 # ---------------------------------------------------------------------------
 # Core fetch + dispatch
 # ---------------------------------------------------------------------------
 
 def _scrape_url(url):
     """
-    Fetches one URL, dispatches to the right parser, returns:
-      { cash_price, seller_name, is_fba, url, platform }
+    Fetches one URL and returns a candidate dict:
+      { cash_price, base_price, seller_name, is_fba, url, platform }
     or None on failure / no valid price.
     """
     platform = _detect_platform(url)
@@ -415,8 +387,6 @@ def _scrape_url(url):
     }
     headers = headers_map.get(platform, _BASE_HEADERS)
 
-    # Magalu requires a warm-up request to the homepage to establish
-    # session cookies and pass CDN bot-detection before the product page.
     if platform == "magalu":
         _warmup_magalu()
 
@@ -435,19 +405,16 @@ def _scrape_url(url):
         if data["cash_price"] is None and jsonld_price:
             data["cash_price"] = _apply_pix_discount(jsonld_price, data.get("pix_discount", 0.0))
         data.setdefault("is_fba", False)
-
     elif platform == "kabum":
         data = _scrape_kabum(soup)
         if data["cash_price"] is None:
             data["cash_price"] = jsonld_price
         data["is_fba"] = False
-
     elif platform == "magalu":
         data = _scrape_magalu(soup, url)
         if data["cash_price"] is None:
             data["cash_price"] = jsonld_price
         data["is_fba"] = False
-
     else:
         data = {"cash_price": jsonld_price, "seller_name": "Unknown", "is_fba": False}
 
@@ -466,15 +433,18 @@ def _scrape_url(url):
     data["platform"] = platform
     return data
 
-
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 def scrape_product(product):
     """
-    Scrapes every URL for the product, compares all valid results,
-    and returns the one with the lowest cash price.
+    Scrapes every URL for the product. Returns a dict with:
+      - best result fields (product_id, seller_name, cash_price, etc.)
+      - 'all_candidates': list of every successfully scraped offer, sorted
+        by cash_price ascending, each containing:
+          { platform, seller_name, cash_price, is_fba, url }
+    Returns None if no URL yields a valid price.
     """
     urls = product.get("urls", [])
     if not urls:
@@ -498,6 +468,21 @@ def scrape_product(product):
         f"via {best['platform'].upper()} ({best['seller_name']})"
     )
 
+    # Normalised candidate list for the notifier (sorted cheapest first)
+    all_candidates = sorted(
+        [
+            {
+                "platform": c["platform"],
+                "seller_name": c["seller_name"],
+                "cash_price": c["cash_price"],
+                "is_fba": c.get("is_fba", False),
+                "url": c["url"],
+            }
+            for c in candidates
+        ],
+        key=lambda c: c["cash_price"],
+    )
+
     return {
         "product_id": product["id"],
         "product_name": product["name"],
@@ -509,6 +494,7 @@ def scrape_product(product):
         "total_effective_cost": best["cash_price"],
         "source_url": best["url"],
         "source_platform": best["platform"],
+        "all_candidates": all_candidates,
     }
 
 

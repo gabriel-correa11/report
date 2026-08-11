@@ -20,7 +20,7 @@ def main():
     for product in products:
         print(f"\n[Main] Processing product_id={product['id']} ({product['name']})")
         try:
-            # a. Scrape with retry logic (max 3 attempts)
+            # a. Scrape all URLs, return lowest price across platforms
             data = scrape_with_retry(product, max_attempts=3)
 
             if data is None:
@@ -36,6 +36,8 @@ def main():
             seller_info = {
                 "seller_name": data.get("seller_name"),
                 "is_fba": data.get("is_fba", False),
+                "source_url": data.get("source_url"),
+                "source_platform": data.get("source_platform"),
             }
 
             # d. Always send Discord notification

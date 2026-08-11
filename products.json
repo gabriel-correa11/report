@@ -1,22 +1,13 @@
 [
   {
     "id": "nintendo-switch-2",
-    "name": "Nintendo Switch 2",
-    "url": "https://www.amazon.com.br/dp/B098RKWHHZ",
-    "platform": "amazon",
-    "target_price": 2500.00,
-    "max_alert_threshold": 3700.00,
-    "min_seller_rating": 85,
-    "require_fba": true
-  },
-  {
-    "id": "xiaomi-vacuum-h50",
-    "name": "Robô Aspirador Xiaomi Robot Vacuum H50 10000Pa",
-    "url": "https://www.magazineluiza.com.br/robo-aspirador-xiaomi-robot-vacuum-h50-10000pa-220v-lancamento-2026-xaiomi/p/cd3jc19g0c/ep/eprb/?seller_id=lojafamashop",
-    "platform": "magalu",
-    "target_price": 2800.00,
-    "max_alert_threshold": 3700.00,
-    "min_seller_rating": 90,
-    "require_fba": false
+    "name": "Nintendo Switch 2 256GB Preto Azul e Vermelho",
+    "target_price": 3500.00,
+    "max_alert_threshold": 3800.00,
+    "urls": [
+      "https://www.amazon.com.br/dp/B0F6D7MQQB/ref=olp-opf-redir?aod=1",
+      "https://www.kabum.com.br/produto/777177/console-nintendo-switch-2-256gb-preto-azul-e-vermelho",
+      "https://www.magazineluiza.com.br/console-nintendo-switch-2-256gb-preto-azul-e-vermelho/p/hcd2h7h0gb/ga/coni/?seller_id=kabum"
+    ]
   }
 ]

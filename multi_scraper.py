@@ -17,11 +17,7 @@ def clean_price(text):
     if not text:
         return None
     cleaned = re.sub(r"[^\d,]", "", text.strip())
-    # Handle Brazilian format: 3.846,55 -> 3846.55
-    # After stripping non-numeric/non-comma, we may have: 384655 or 384655 or 384655
-    # We need to detect if there are commas and treat last comma as decimal separator
     if "," in cleaned:
-        # Everything before last comma is integer part (strip internal dots already removed), after is decimal
         parts = cleaned.rsplit(",", 1)
         integer_part = parts[0].replace(",", "")
         decimal_part = parts[1]
@@ -32,9 +28,22 @@ def clean_price(text):
         return None
 
 
+def _detect_platform(url):
+    """Infer platform name from URL hostname."""
+    host = urlparse(url).hostname or ""
+    if "amazon" in host:
+        return "amazon"
+    if "kabum" in host:
+        return "kabum"
+    if "magazineluiza" in host or "magalu" in host:
+        return "magalu"
+    return "generic"
+
+
 def _parse_jsonld(soup):
-    """Primary parser: extract price from JSON-LD structured data."""
+    """Primary parser: extract lowest price from JSON-LD structured data."""
     scripts = soup.find_all("script", type="application/ld+json")
+    best = None
     for script in scripts:
         try:
             data = json.loads(script.string or "")
@@ -44,173 +53,236 @@ def _parse_jsonld(soup):
         items = data if isinstance(data, list) else [data]
         for item in items:
             item_type = item.get("@type", "")
-            # Handle Product type with nested offers
+            price = None
             if item_type == "Product":
                 offers = item.get("offers", {})
                 if isinstance(offers, list):
                     offers = offers[0] if offers else {}
                 price = offers.get("price") or offers.get("lowPrice")
-                if price:
-                    try:
-                        return float(str(price).replace(",", "."))
-                    except ValueError:
-                        pass
-            # Handle standalone Offer type
-            if item_type in ("Offer", "AggregateOffer"):
+            elif item_type in ("Offer", "AggregateOffer"):
                 price = item.get("price") or item.get("lowPrice")
-                if price:
-                    try:
-                        return float(str(price).replace(",", "."))
-                    except ValueError:
-                        pass
-    return None
+            if price:
+                try:
+                    val = float(str(price).replace(",", "."))
+                    if best is None or val < best:
+                        best = val
+                except ValueError:
+                    pass
+    return best
 
 
-def _scrape_amazon(soup, product):
-    """Amazon-specific DOM fallback parser."""
-    result = {
-        "cash_price": None,
-        "standard_price": None,
-        "seller_name": "Amazon",
-        "is_fba": False,
-        "shipping_cost": 0.0,
-    }
+# ---------------------------------------------------------------------------
+# Platform-specific parsers
+# ---------------------------------------------------------------------------
 
-    # Price extraction
-    price_el = soup.select_one("#corePrice_feature_div .a-offscreen")
-    if not price_el:
-        price_el = soup.select_one("#priceblock_ourprice")
+def _scrape_amazon(soup, url):
+    """
+    Amazon parser. For AOD pages (aod=1), iterates all offer rows in
+    #aod-offer-list and picks the lowest. Falls back to buy-box selectors.
+    Returns dict with cash_price, seller_name, is_fba.
+    """
+    result = {"cash_price": None, "seller_name": "Amazon", "is_fba": False}
+
+    # --- All Offers Display (aod=1) ---
+    aod_list = soup.select_one("#aod-offer-list")
+    if aod_list:
+        best_price = None
+        best_seller = "Amazon"
+        best_fba = False
+        for offer in aod_list.select("#aod-offer"):
+            price_el = offer.select_one(".a-offscreen") or offer.select_one(".a-price-whole")
+            price = clean_price(price_el.get_text()) if price_el else None
+            if price is None:
+                continue
+            seller_el = offer.select_one("#aod-offer-soldBy .a-size-small") or \
+                        offer.select_one("#aod-offer-soldBy span")
+            seller = seller_el.get_text(strip=True) if seller_el else "Amazon"
+            offer_text = offer.get_text()
+            fba = ("Enviado pela Amazon" in offer_text or
+                   "Fulfilled by Amazon" in offer_text or
+                   "Amazon" in seller)
+            if best_price is None or price < best_price:
+                best_price = price
+                best_seller = seller
+                best_fba = fba
+        if best_price:
+            result["cash_price"] = best_price
+            result["seller_name"] = best_seller
+            result["is_fba"] = best_fba
+            return result
+
+    # --- Standard buy-box fallback ---
+    price_el = soup.select_one("#corePrice_feature_div .a-offscreen") or \
+               soup.select_one("#priceblock_ourprice")
     if price_el:
         result["cash_price"] = clean_price(price_el.get_text())
-        result["standard_price"] = result["cash_price"]
 
-    # Seller name
-    seller_el = soup.select_one("#sellerProfileTriggerId")
-    if not seller_el:
-        seller_el = soup.select_one("#merchant-info")
+    seller_el = soup.select_one("#sellerProfileTriggerId") or \
+                soup.select_one("#merchant-info")
     if seller_el:
         result["seller_name"] = seller_el.get_text(strip=True)
 
-    # FBA detection
     page_text = soup.get_text()
     if "Enviado pela Amazon" in page_text or "Dispatched from and sold by Amazon" in page_text:
         result["is_fba"] = True
 
-    # Seller rating check
-    rating_match = re.search(r"(\d{1,3})%\s*positiv", page_text, re.IGNORECASE)
-    if rating_match:
-        rating = int(rating_match.group(1))
-        min_rating = product.get("min_seller_rating", 0)
-        if rating < min_rating:
-            print(f"[Scraper] Amazon seller rating {rating}% below minimum {min_rating}%. Discarding offer.")
-            return None
+    return result
+
+
+def _scrape_kabum(soup):
+    """
+    Kabum parser. Extracts cash/PIX price and seller name.
+    Returns dict with cash_price, seller_name.
+    """
+    result = {"cash_price": None, "seller_name": "KaBuM!"}
+
+    # Cash / PIX price selectors
+    for selector in [
+        'span[class*="finalPrice"]',
+        'span[class*="priceCard"]',
+        'b[class*="regularPrice"]',
+        'span[class*="sc-"]',   # generic styled-component span with price-like text
+    ]:
+        el = soup.select_one(selector)
+        if el:
+            price = clean_price(el.get_text())
+            if price and price > 1:
+                result["cash_price"] = price
+                break
+
+    # Fallback: find any element whose text looks like a BRL price
+    if result["cash_price"] is None:
+        for el in soup.find_all(string=re.compile(r"R\$\s*[\d\.]+")):
+            price = clean_price(el)
+            if price and price > 100:
+                result["cash_price"] = price
+                break
+
+    # Seller (marketplace info)
+    seller_el = soup.select_one('[class*="sellerName"]') or \
+                soup.select_one('[class*="seller-name"]')
+    if seller_el:
+        result["seller_name"] = seller_el.get_text(strip=True)
 
     return result
 
 
-def _scrape_magalu(soup, product_url):
-    """Magazine Luiza-specific DOM fallback parser."""
-    result = {
-        "cash_price": None,
-        "standard_price": None,
-        "seller_name": None,
-        "is_fba": False,
-        "shipping_cost": 0.0,
-    }
+def _scrape_magalu(soup, url):
+    """
+    Magazine Luiza parser. Extracts cash price and seller from DOM or URL param.
+    Returns dict with cash_price, seller_name.
+    """
+    result = {"cash_price": None, "seller_name": "Magalu"}
 
-    # Cash price
-    cash_el = soup.select_one('p[data-testid="price-value"]')
+    cash_el = soup.select_one('p[data-testid="price-value"]') or \
+              soup.select_one('[data-testid="price-value"]')
     if cash_el:
         result["cash_price"] = clean_price(cash_el.get_text())
 
-    # Standard/original price
-    std_el = soup.select_one('p[data-testid="price-original"]')
-    if std_el:
-        result["standard_price"] = clean_price(std_el.get_text())
-    else:
-        result["standard_price"] = result["cash_price"]
-
-    # Seller name: try DOM first, then URL param
-    seller_el = soup.select_one('p[data-testid="seller-info"]')
+    seller_el = soup.select_one('p[data-testid="seller-info"]') or \
+                soup.select_one('[data-testid="seller-name"]')
     if seller_el:
         result["seller_name"] = seller_el.get_text(strip=True)
     else:
-        parsed = urlparse(product_url)
-        params = parse_qs(parsed.query)
+        params = parse_qs(urlparse(url).query)
         seller_id = params.get("seller_id", [None])[0]
-        result["seller_name"] = seller_id or "Magalu"
+        if seller_id:
+            result["seller_name"] = seller_id
 
     return result
 
 
-def scrape_product(product):
-    """
-    Attempts to scrape price data for a product.
-    Returns a dict with price fields or None if scraping failed.
-    """
-    url = product["url"]
-    platform = product.get("platform", "").lower()
+# ---------------------------------------------------------------------------
+# Core scraping logic
+# ---------------------------------------------------------------------------
 
+def _scrape_url(url):
+    """
+    Fetches a single URL and returns a raw result dict:
+      { cash_price, seller_name, is_fba, url, platform }
+    or None on failure.
+    """
+    platform = _detect_platform(url)
     try:
-        response = requests.get(url, headers=HEADERS, timeout=20)
+        response = requests.get(url, headers=HEADERS, timeout=25)
         response.raise_for_status()
     except requests.RequestException as e:
         print(f"[Scraper] HTTP error for {url}: {e}")
         return None
 
     soup = BeautifulSoup(response.text, "html.parser")
-
-    # --- Primary: JSON-LD ---
     jsonld_price = _parse_jsonld(soup)
 
-    platform_data = None
-
-    # --- Fallback: platform-specific parsers ---
     if platform == "amazon":
-        platform_data = _scrape_amazon(soup, product)
-        if platform_data is None:
-            return None  # Discarded due to seller rating
-        if jsonld_price and platform_data["cash_price"] is None:
-            platform_data["cash_price"] = jsonld_price
-            platform_data["standard_price"] = jsonld_price
-        elif jsonld_price:
-            platform_data["cash_price"] = jsonld_price
+        data = _scrape_amazon(soup, url)
+        # JSON-LD can be more reliable for buy-box; use it if DOM failed
+        if data["cash_price"] is None and jsonld_price:
+            data["cash_price"] = jsonld_price
+        data["is_fba"] = data.get("is_fba", False)
+
+    elif platform == "kabum":
+        data = _scrape_kabum(soup)
+        if data["cash_price"] is None and jsonld_price:
+            data["cash_price"] = jsonld_price
+        data["is_fba"] = False
 
     elif platform == "magalu":
-        platform_data = _scrape_magalu(soup, url)
-        if jsonld_price and platform_data["cash_price"] is None:
-            platform_data["cash_price"] = jsonld_price
-            platform_data["standard_price"] = jsonld_price
-        elif jsonld_price:
-            platform_data["cash_price"] = jsonld_price
+        data = _scrape_magalu(soup, url)
+        if data["cash_price"] is None and jsonld_price:
+            data["cash_price"] = jsonld_price
+        data["is_fba"] = False
 
     else:
-        # Generic: JSON-LD only
-        if jsonld_price:
-            platform_data = {
-                "cash_price": jsonld_price,
-                "standard_price": jsonld_price,
-                "seller_name": "Unknown",
-                "is_fba": False,
-                "shipping_cost": 0.0,
-            }
+        data = {
+            "cash_price": jsonld_price,
+            "seller_name": "Unknown",
+            "is_fba": False,
+        }
 
-    if platform_data is None or platform_data.get("cash_price") is None:
-        print(f"[Scraper] Could not extract price for product_id={product['id']}")
+    if not data.get("cash_price"):
+        print(f"[Scraper] No price found at {url}")
         return None
 
-    shipping = platform_data.get("shipping_cost") or 0.0
-    total = platform_data["cash_price"] + shipping
+    data["url"] = url
+    data["platform"] = platform
+    return data
+
+
+def scrape_product(product):
+    """
+    Scrapes all URLs for a product, compares results, and returns the
+    overall lowest price with its source URL and seller info.
+    """
+    urls = product.get("urls", [])
+    if not urls:
+        print(f"[Scraper] No URLs defined for product_id={product['id']}")
+        return None
+
+    candidates = []
+    for url in urls:
+        print(f"[Scraper] Fetching {url}")
+        result = _scrape_url(url)
+        if result:
+            candidates.append(result)
+            print(f"[Scraper]  -> {result['platform']} | {result['seller_name']} | R$ {result['cash_price']:.2f}")
+
+    if not candidates:
+        return None
+
+    # Pick the lowest cash price across all platforms
+    best = min(candidates, key=lambda r: r["cash_price"])
 
     return {
         "product_id": product["id"],
         "product_name": product["name"],
-        "seller_name": platform_data.get("seller_name"),
-        "is_fba": platform_data.get("is_fba", False),
-        "standard_price": platform_data.get("standard_price"),
-        "cash_price": platform_data["cash_price"],
-        "shipping_cost": shipping,
-        "total_effective_cost": total,
+        "seller_name": best["seller_name"],
+        "is_fba": best.get("is_fba", False),
+        "standard_price": best["cash_price"],
+        "cash_price": best["cash_price"],
+        "shipping_cost": 0.0,
+        "total_effective_cost": best["cash_price"],
+        "source_url": best["url"],
+        "source_platform": best["platform"],
     }
 
 

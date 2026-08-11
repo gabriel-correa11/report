@@ -1,6 +1,5 @@
 import io
 import json
-import os
 import sqlite3
 from datetime import datetime, timezone
 
@@ -40,7 +39,6 @@ def _fetch_7d_history(product_id):
         )
         rows = cursor.fetchall()
         conn.close()
-        # Parse ISO datetime strings from SQLite
         result = []
         for ts, price in rows:
             try:
@@ -75,7 +73,6 @@ def generate_price_chart(product_id, product_name, max_alert_threshold):
     Returns PNG bytes (io.BytesIO) or None if there is insufficient data.
     """
     history = _fetch_7d_history(product_id)
-
     if not history:
         return None
 
@@ -85,12 +82,10 @@ def generate_price_chart(product_id, product_name, max_alert_threshold):
     fig, ax = plt.subplots(figsize=(10, 4.5), facecolor=_BG_COLOR)
     ax.set_facecolor(_SURFACE_COLOR)
 
-    # Price line
     ax.plot(dates, prices, color=_LINE_COLOR, linewidth=2.5, marker="o",
             markersize=4, markerfacecolor=_LINE_COLOR, zorder=3)
     ax.fill_between(dates, prices, alpha=0.12, color=_LINE_COLOR)
 
-    # Threshold reference line
     ax.axhline(
         y=max_alert_threshold,
         color=_THRESHOLD_COLOR,
@@ -100,7 +95,6 @@ def generate_price_chart(product_id, product_name, max_alert_threshold):
         zorder=2,
     )
 
-    # Axes formatting
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%d/%m %Hh"))
     ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=4, maxticks=8))
     fig.autofmt_xdate(rotation=30, ha="right")
@@ -111,7 +105,6 @@ def generate_price_chart(product_id, product_name, max_alert_threshold):
         )
     )
 
-    # Colors
     for spine in ax.spines.values():
         spine.set_edgecolor(_GRID_COLOR)
     ax.tick_params(colors=_TEXT_COLOR, labelsize=9)
@@ -126,7 +119,7 @@ def generate_price_chart(product_id, product_name, max_alert_threshold):
         pad=12,
     )
 
-    legend = ax.legend(
+    ax.legend(
         facecolor=_BG_COLOR,
         edgecolor=_GRID_COLOR,
         labelcolor=_TEXT_COLOR,
@@ -142,9 +135,15 @@ def generate_price_chart(product_id, product_name, max_alert_threshold):
     return buf
 
 
+def _fmt_brl(value):
+    """Format a float as Brazilian currency string: 3846.55 -> 'R$ 3.846,55'"""
+    return f"R$ {value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
 def send_discord_alert(product, analytics, seller_info):
     """
     Sends a Discord embed with an attached price history chart on every run.
+    seller_info must include 'source_url' (the winning platform URL).
     """
     if not DISCORD_WEBHOOK_URL:
         print("[Notifier] DISCORD_WEBHOOK_URL not set. Skipping notification.")
@@ -153,12 +152,14 @@ def send_discord_alert(product, analytics, seller_info):
     current_price = analytics.get("current_cash_price") or 0.0
     low_7d = analytics.get("low_7d") or 0.0
     avg_7d = analytics.get("avg_7d") or 0.0
-    max_threshold = product.get("max_alert_threshold", 3700.00)
+    max_threshold = product.get("max_alert_threshold", 3800.00)
     target_price = product.get("target_price", 0.0)
 
     seller_name = seller_info.get("seller_name") or "Desconhecido"
     is_fba = seller_info.get("is_fba", False)
-    delivery_label = "FBA ✅ (Enviado pela Amazon)" if is_fba else "Direta pelo Vendedor"
+    source_url = seller_info.get("source_url") or product.get("urls", [""])[0]
+    source_platform = seller_info.get("source_platform", "").capitalize()
+    delivery_label = "FBA ✅ (Enviado pela Amazon)" if is_fba else f"Direto — {source_platform}"
 
     if current_price <= max_threshold:
         embed_title = "🚨 ALERTA DE PREÇO - OPORTUNIDADE!"
@@ -170,7 +171,7 @@ def send_discord_alert(product, analytics, seller_info):
     embed = {
         "title": embed_title,
         "color": embed_color,
-        "url": product["url"],
+        "url": source_url,
         "fields": [
             {
                 "name": "📦 Produto",
@@ -178,12 +179,12 @@ def send_discord_alert(product, analytics, seller_info):
                 "inline": False,
             },
             {
-                "name": "💰 Preço à Vista Atual",
-                "value": f"R$ {current_price:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."),
+                "name": "💰 Menor Preço Encontrado",
+                "value": _fmt_brl(current_price),
                 "inline": True,
             },
             {
-                "name": "🚚 Vendedor & Entrega",
+                "name": "🚚 Vendedor & Plataforma",
                 "value": f"{seller_name}\n{delivery_label}",
                 "inline": True,
             },
@@ -194,12 +195,12 @@ def send_discord_alert(product, analytics, seller_info):
             },
             {
                 "name": "📉 Menor Preço (7 Dias)",
-                "value": f"R$ {low_7d:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."),
+                "value": _fmt_brl(low_7d),
                 "inline": True,
             },
             {
                 "name": "📊 Média de Preço (7 Dias)",
-                "value": f"R$ {avg_7d:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."),
+                "value": _fmt_brl(avg_7d),
                 "inline": True,
             },
             {
@@ -209,12 +210,12 @@ def send_discord_alert(product, analytics, seller_info):
             },
             {
                 "name": "🎯 Preço Alvo",
-                "value": f"R$ {target_price:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."),
+                "value": _fmt_brl(target_price),
                 "inline": True,
             },
             {
                 "name": "🔴 Teto de Oportunidade",
-                "value": f"R$ {max_threshold:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."),
+                "value": _fmt_brl(max_threshold),
                 "inline": True,
             },
         ],
@@ -225,8 +226,6 @@ def send_discord_alert(product, analytics, seller_info):
     }
 
     payload = {"embeds": [embed]}
-
-    # Generate chart
     chart_buf = generate_price_chart(product["id"], product["name"], max_threshold)
 
     try:
@@ -239,7 +238,6 @@ def send_discord_alert(product, analytics, seller_info):
                 timeout=20,
             )
         else:
-            # No chart data yet — send embed only (remove image field)
             del embed["image"]
             response = requests.post(
                 DISCORD_WEBHOOK_URL,
